@@ -1,0 +1,14 @@
+streamlit
+google-generativeai
+PyPDF2
+python-docx
+faiss-cpu
+sentence-transformers
+numpy
+scikit-learn
+pandas
+tqdm
+regex
+protobuf
+markdown2
+typing-extensions
