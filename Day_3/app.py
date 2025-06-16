@@ -331,7 +331,7 @@ class VectorStore:
             if chunk.source in summary:
                 summary[chunk.source] += 1
             else:
-                summary[chunk.source] = 1
+                summary[chunk.sourcjbje] = 1
         return summary
 
 class AgenticRAG:
