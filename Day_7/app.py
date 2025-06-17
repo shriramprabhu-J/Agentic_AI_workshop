@@ -4,7 +4,7 @@ import json
 import datetime
 from datetime import datetime, timedelta
 import plotly.express as px
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import google.generativeai as genai
 import re
 import tempfile
@@ -18,6 +18,7 @@ from langchain.prompts import PromptTemplate
 from dataclasses import dataclass, asdict, field
 from PyPDF2 import PdfReader
 import base64
+import hashlib
 
 # Configure Streamlit
 st.set_page_config(
@@ -54,10 +55,17 @@ class LifeEvent:
     def __post_init__(self):
         # Convert date strings to datetime objects
         if not isinstance(self.date, datetime):
-            self.date = datetime.strptime(self.date, '%Y-%m-%d')
+            try:
+                self.date = datetime.strptime(self.date, '%Y-%m-%d')
+            except (TypeError, ValueError):
+                self.date = datetime.now()
+                
         if not isinstance(self.end_date, datetime):
             if self.end_date:
-                self.end_date = datetime.strptime(self.end_date, '%Y-%m-%d')
+                try:
+                    self.end_date = datetime.strptime(self.end_date, '%Y-%m-%d')
+                except (TypeError, ValueError):
+                    self.end_date = self.date
             else:
                 self.end_date = self.date
 
@@ -68,7 +76,302 @@ class FatigueMetrics:
     recommended_intensity: float
     weekly_capacity: float
 
-class RAGStudyAdvisor:
+# ======================
+# AGENT IMPLEMENTATIONS
+# ======================
+
+class CalendarSyncAgent:
+    """Parses academic calendars and personal events from CSV/JSON"""
+    @staticmethod
+    def parse_uploaded_events(uploaded_file) -> List[Dict]:
+        """Parse uploaded CSV/JSON events"""
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+                # Ensure required columns exist
+                required_cols = ['name', 'date', 'event_type', 'impact_level']
+                for col in required_cols:
+                    if col not in df.columns:
+                        st.error(f"Missing required column: {col}")
+                        return []
+                        
+                # Convert dates to string format if they're Timestamps
+                df['date'] = df['date'].astype(str)
+                if 'end_date' in df.columns:
+                    df['end_date'] = df['end_date'].astype(str)
+                else:
+                    df['end_date'] = df['date']
+                    
+                # Fill missing description
+                if 'description' not in df.columns:
+                    df['description'] = ""
+                    
+                return df.to_dict('records')
+                
+            elif uploaded_file.name.endswith('.json'):
+                events = json.load(uploaded_file)
+                # Ensure proper format
+                for event in events:
+                    if 'end_date' not in event:
+                        event['end_date'] = event['date']
+                    if 'description' not in event:
+                        event['description'] = ""
+                return events
+                
+        except Exception as e:
+            st.error(f"Error parsing file: {str(e)}")
+        return []
+    
+    @staticmethod
+    def generate_life_events(api_key: str, profile: Dict) -> List[Dict]:
+        """Generate realistic life events using AI"""
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = f"""
+        Generate realistic life events for a {profile['level']} {profile['field']} student
+        over {profile['duration_weeks']} weeks.
+        
+        Include academic, personal, and professional events in JSON format:
+        [
+            {{
+                "name": "Event Name",
+                "date": "YYYY-MM-DD",
+                "end_date": "YYYY-MM-DD",
+                "event_type": "exam/internship/vacation/festival/work/family",
+                "impact_level": 1-5,
+                "description": "Brief description"
+            }}
+        ]
+        
+        Make events realistic and varied in impact.
+        Start from: {datetime.now().strftime('%Y-%m-%d')}
+        Return ONLY the JSON array.
+        """
+        
+        try:
+            response = model.generate_content(prompt)
+            json_data = PersonalizationFrameworkRetrieverAgent.extract_json(response.text)
+            return json.loads(json_data)
+        except Exception as e:
+            st.error(f"Error generating events: {str(e)}")
+            return []
+
+class CognitiveLoadEstimatorAgent:
+    """Evaluates recent activity and fatigue indicators"""
+    @staticmethod
+    def calculate_fatigue_metrics(events: List[LifeEvent], study_hours: float) -> FatigueMetrics:
+        """Calculate fatigue metrics based on events and study load"""
+        # Filter events that are relevant (within next 2 weeks)
+        relevant_events = [
+            e for e in events 
+            if datetime.now() <= e.date <= (datetime.now() + timedelta(days=14))
+        ]
+        
+        # Calculate event impact score
+        impact_score = sum(
+            min(5, max(1, e.impact_level)) * 
+            (1 - (e.date - datetime.now()).days / 14)
+            for e in relevant_events
+        )
+        
+        # Normalize impact score (0-1 scale)
+        normalized_impact = min(1.0, impact_score / 15.0)
+        
+        # Calculate base load based on study hours
+        base_load = min(study_hours / 40.0, 1.0)
+        
+        # Calculate metrics
+        mental_load = min(0.95, base_load + (normalized_impact * 0.3))
+        stress_level = min(0.95, base_load * 0.6 + normalized_impact * 0.4)
+        
+        # Determine recommendations based on stress level
+        if stress_level > 0.7:
+            intensity = 0.4
+            capacity = 0.5
+        elif stress_level > 0.5:
+            intensity = 0.6
+            capacity = 0.7
+        else:
+            intensity = 0.8
+            capacity = 0.9
+            
+        return FatigueMetrics(
+            mental_load=mental_load,
+            stress_level=stress_level,
+            recommended_intensity=intensity,
+            weekly_capacity=capacity
+        )
+
+class ScheduleOptimizerAgent:
+    """Dynamically reshuffles modules and recommends adjustments"""
+    def __init__(self, api_key: str):
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    @staticmethod
+    def extract_json(text: str) -> str:
+        """Robust JSON extraction from AI response"""
+        # Clean response text
+        text = text.strip().replace('\\"', '"').replace('\\n', '')
+        
+        # First try to parse the entire text as JSON
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
+            
+        # Try to find JSON objects using multiple strategies
+        patterns = [
+            r'```json\s*({.*?})\s*```',  # Markdown code block
+            r'```\s*({.*?})\s*```',       # Generic code block
+            r'({.*})',                     # Simple curly braces
+            r'(\[.*\])'                    # Array format
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.DOTALL)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match = match[0]  # Handle capture groups
+                try:
+                    # Try to parse as JSON
+                    parsed = json.loads(match)
+                    return json.dumps(parsed)  # Return valid JSON string
+                except json.JSONDecodeError:
+                    # Attempt to fix common issues
+                    try:
+                        # Remove trailing commas
+                        fixed = re.sub(r',\s*([}\]])', r'\1', match)
+                        # Replace single quotes with double quotes
+                        fixed = fixed.replace("'", '"')
+                        # Fix unescaped quotes
+                        fixed = re.sub(r'(?<!\\)"', r'\"', fixed)
+                        parsed = json.loads(fixed)
+                        return json.dumps(parsed)
+                    except:
+                        continue
+        
+        # Final fallback - return empty schedule
+        st.warning("Could not extract valid JSON from response. Using empty schedule.")
+        return '{"schedule": []}'
+
+    def create_adaptive_schedule(self, modules: List[StudyModule], events: List[LifeEvent], 
+                                fatigue: FatigueMetrics) -> List[Dict]:
+        """Create event-aware schedule"""
+        # FIXED: Removed extra bracket in the events list comprehension
+        # Create a filtered list of upcoming events
+        upcoming_events = [
+            {'name': e.name, 'date': e.date.strftime('%Y-%m-%d'), 'impact': e.impact_level} 
+            for e in events 
+            if e.date >= datetime.now()
+        ][:10]
+        
+        prompt = f"""
+        Create an adaptive study schedule considering:
+        
+        Modules: {[{'name': m.name, 'hours': m.estimated_hours, 'priority': m.priority} for m in modules]}
+        
+        Upcoming Events: {upcoming_events}
+        
+        Fatigue Metrics:
+        - Mental Load: {fatigue.mental_load:.2f}
+        - Stress Level: {fatigue.stress_level:.2f}
+        - Recommended Intensity: {fatigue.recommended_intensity:.2f}
+        
+        Generate 30-day schedule in JSON format (ONLY respond with valid JSON):
+        {{
+            "schedule": [
+                {{
+                    "date": "YYYY-MM-DD",
+                    "module": "Module Name",
+                    "duration_hours": float,
+                    "intensity": float,
+                    "focus_topics": "Specific topics for this session",
+                    "scheduling_reason": "Why scheduled this way",
+                    "conflict_avoidance": "How conflicts were avoided"
+                }}
+            ]
+        }}
+        
+        Rules:
+        - Avoid high-impact event dates
+        - Reduce intensity during stress periods
+        - Prioritize modules by deadline and importance
+        - Use spaced repetition principles
+        
+        Start from: {datetime.now().strftime('%Y-%m-%d')}
+        """
+        
+        try:
+            response = self.model.generate_content(prompt)
+            json_data = self.extract_json(response.text)
+            
+            # Parse JSON response
+            parsed = json.loads(json_data)
+            
+            # Handle different response formats
+            if 'schedule' in parsed:
+                schedule_data = parsed['schedule']
+            elif isinstance(parsed, list):
+                schedule_data = parsed
+            else:
+                raise ValueError("Unexpected schedule format")
+            
+            schedule = []
+            for session in schedule_data:
+                try:
+                    schedule.append({
+                        'date': datetime.strptime(session['date'], '%Y-%m-%d'),
+                        'module': session['module'],
+                        'duration_hours': float(session['duration_hours']),
+                        'intensity': float(session['intensity']),
+                        'focus_topics': session['focus_topics'],
+                        'scheduling_reason': session['scheduling_reason'],
+                        'conflict_avoidance': session['conflict_avoidance']
+                    })
+                except (KeyError, ValueError) as e:
+                    st.error(f"Error parsing session: {str(e)}")
+                    continue
+            
+            return sorted(schedule, key=lambda x: x['date'])
+        except Exception as e:
+            st.error(f"Error creating schedule: {str(e)}")
+            if 'response' in locals():
+                st.text(f"Response content: {response.text[:500]}...")
+            return []
+    
+    def generate_adaptive_alerts(self, events: List[LifeEvent], schedule: List[Dict]) -> List[str]:
+        """Generate context-aware study alerts"""
+        alerts = []
+        upcoming_events = [e for e in events if 0 <= (e.date - datetime.now()).days <= 7]
+        
+        for event in upcoming_events:
+            if event.impact_level >= 4:
+                if event.event_type in ['exam', 'test', 'assignment']:
+                    alerts.append(f"🚨 {event.name} in {(event.date - datetime.now()).days} days - Switch to review mode, avoid new topics")
+                elif event.event_type in ['vacation', 'internship']:
+                    alerts.append(f"⚠️ {event.name} approaching - Complete current modules early, adjust schedule")
+                elif event.event_type in ['family', 'festival']:
+                    alerts.append(f"📅 {event.name} this week - Reduce study intensity, focus on light review")
+        
+        # Add fatigue-based alerts
+        daily_hours = {}
+        for session in schedule:
+            date_str = session['date'].strftime('%Y-%m-%d')
+            daily_hours[date_str] = daily_hours.get(date_str, 0) + session['duration_hours']
+        
+        for date, hours in daily_hours.items():
+            if hours > 6:
+                alerts.append(f"🔥 Heavy workload on {date} ({hours} hours) - Consider redistributing")
+            elif hours > 4 and any(e for e in events if e.date.strftime('%Y-%m-%d') == date and e.impact_level >= 3):
+                alerts.append(f"⚠️ Moderate workload on event day ({date}) - Reduce study time")
+        
+        return alerts
+
+class PersonalizationFrameworkRetrieverAgent:
+    """Uses RAG to fetch adaptive learning methods from research"""
     def __init__(self, api_key: str):
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model="models/embedding-001",
@@ -81,54 +384,126 @@ class RAGStudyAdvisor:
         )
         self.vector_store = None
         self.qa_chain = None
+        self.file_hashes = set()
+    
+    @staticmethod
+    def extract_json(text: str) -> str:
+        """Robust JSON extraction from AI response"""
+        # Clean response text
+        text = text.strip().replace('\\"', '"').replace('\\n', '')
         
-    def initialize_knowledge_base(self, pdf_files: List):
-        """Initialize RAG with uploaded PDF documents"""
-        if not pdf_files:
-            st.error("Please upload at least one PDF file for the knowledge base")
-            return None
+        # First try to parse the entire text as JSON
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
             
-        documents = []
+        # Try to find JSON objects using multiple strategies
+        patterns = [
+            r'```json\s*({.*?})\s*```',  # Markdown code block
+            r'```\s*({.*?})\s*```',       # Generic code block
+            r'({.*})',                     # Simple curly braces
+            r'(\[.*\])'                    # Array format
+        ]
         
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.DOTALL)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match = match[0]  # Handle capture groups
+                try:
+                    # Try to parse as JSON
+                    parsed = json.loads(match)
+                    return json.dumps(parsed)  # Return valid JSON string
+                except json.JSONDecodeError:
+                    # Attempt to fix common issues
+                    try:
+                        # Remove trailing commas
+                        fixed = re.sub(r',\s*([}\]])', r'\1', match)
+                        # Replace single quotes with double quotes
+                        fixed = fixed.replace("'", '"')
+                        # Fix unescaped quotes
+                        fixed = re.sub(r'(?<!\\)"', r'\"', fixed)
+                        parsed = json.loads(fixed)
+                        return json.dumps(parsed)
+                    except:
+                        continue
+        
+        # Final fallback - return empty schedule
+        st.warning("Could not extract valid JSON from response. Using empty schedule.")
+        return '{"schedule": []}'
+
+    def initialize_knowledge_base(self, pdf_files: List):
+        """Initialize RAG with static PDF + user-uploaded PDF documents"""
+        if not pdf_files:
+            st.error("Please upload at least one PDF file to combine with our knowledge base")
+            return None
+        
+        documents = []
+    
+        # 1. Process STATIC PDF
+        try:
+            static_pdf_path = "E:\Agentic_AI_workshop\Day_7\Adaptive_learning_productivity_strategies.pdf"
+            file_hash = hashlib.md5(static_pdf_path.encode()).hexdigest()
+            
+            # Only process if not already in knowledge base
+            if file_hash not in self.file_hashes:
+                static_reader = PdfReader(static_pdf_path)
+                static_text = ""
+                for page in static_reader.pages:
+                    static_text += page.extract_text() + "\n"
+                documents.append(Document(page_content=static_text))
+                self.file_hashes.add(file_hash)
+        except Exception as e:
+            st.error(f"Error loading static knowledge base: {str(e)}")
+            return None
+
+        # 2. Process USER-UPLOADED PDFs
         for pdf_file in pdf_files:
-            # Save to temporary file
+            # Calculate file hash to avoid duplicates
+            file_hash = hashlib.md5(pdf_file.getvalue()).hexdigest()
+            
+            if file_hash in self.file_hashes:
+                continue
+                
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(pdf_file.read())
                 tmp_path = tmp.name
             
             try:
-                # Extract text from PDF
                 text = ""
                 reader = PdfReader(tmp_path)
                 for page in reader.pages:
                     text += page.extract_text() + "\n"
-                
-                # Create document
                 documents.append(Document(page_content=text))
+                self.file_hashes.add(file_hash)
             except Exception as e:
-                st.error(f"Error processing PDF: {str(e)}")
+                st.error(f"Error processing {pdf_file.name}: {str(e)}")
             finally:
-                # Clean up temporary file
                 os.unlink(tmp_path)
-        
+    
         if not documents:
-            st.error("No valid documents extracted from PDFs")
-            return None
-            
+            st.info("All documents already processed in knowledge base")
+            return self.qa_chain
+        
         # Split documents
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200
         )
         splits = text_splitter.split_documents(documents)
-        
-        # Create vector store
+    
+        # Create or update vector store
         try:
-            self.vector_store = FAISS.from_documents(splits, self.embeddings)
+            if self.vector_store is None:
+                self.vector_store = FAISS.from_documents(splits, self.embeddings)
+            else:
+                self.vector_store.add_documents(splits)
         except Exception as e:
-            st.error(f"Error creating vector store: {str(e)}")
+            st.error(f"Error creating vector database: {str(e)}")
             return None
-        
+    
         # Create QA chain
         template = """Use the following context to answer the question about study planning:
 
@@ -144,25 +519,28 @@ Answer:"""
             template=template,
             input_variables=["context", "question"]
         )
-        
+    
         try:
             self.qa_chain = RetrievalQA.from_chain_type(
                 llm=self.llm,
                 chain_type="stuff",
-                retriever=self.vector_store.as_retriever(search_kwargs={"k": 5}),
-                chain_type_kwargs={"prompt": prompt}
+                retriever=self.vector_store.as_retriever(search_kwargs={"k": 3}),
+                chain_type_kwargs={"prompt": prompt},
+                return_source_documents=False
             )
             return self.qa_chain
         except Exception as e:
-            st.error(f"Error creating QA chain: {str(e)}")
+            st.error(f"Error creating question-answering system: {str(e)}")
             return None
 
-class LifeEventStudyPlanner:
+class StudyModuleGeneratorAgent:
+    """Generates study modules based on user profile"""
     def __init__(self, api_key: str):
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-1.5-flash')
-        
-    def extract_json(self, text: str) -> str:
+    
+    @staticmethod
+    def extract_json(text: str) -> str:
         """Robust JSON extraction from AI response"""
         # Clean response text
         text = text.strip().replace('\\"', '"').replace('\\n', '')
@@ -253,197 +631,10 @@ class LifeEventStudyPlanner:
         except Exception as e:
             st.error(f"Error generating modules: {str(e)}")
             return []
-    
-    def generate_life_events(self, profile: Dict) -> List[Dict]:
-        """Generate realistic life events"""
-        prompt = f"""
-        Generate realistic life events for a {profile['level']} {profile['field']} student
-        over {profile['duration_weeks']} weeks.
-        
-        Include academic, personal, and professional events in JSON format:
-        [
-            {{
-                "name": "Event Name",
-                "date": "YYYY-MM-DD",
-                "end_date": "YYYY-MM-DD",
-                "event_type": "exam/internship/vacation/festival/work/family",
-                "impact_level": 1-5,
-                "description": "Brief description"
-            }}
-        ]
-        
-        Make events realistic and varied in impact.
-        Start from: {datetime.now().strftime('%Y-%m-%d')}
-        Return ONLY the JSON array.
-        """
-        
-        try:
-            response = self.model.generate_content(prompt)
-            json_data = self.extract_json(response.text)
-            return json.loads(json_data)
-        except Exception as e:
-            st.error(f"Error generating events: {str(e)}")
-            return []
-    
-    def calculate_fatigue_metrics(self, events: List[LifeEvent], study_hours: float) -> FatigueMetrics:
-        """AI-powered fatigue assessment"""
-        high_impact_events = [e for e in events if e.impact_level >= 4]
-        upcoming_stress = len([e for e in high_impact_events if e.date <= datetime.now() + timedelta(days=14)])
-        
-        base_load = min(study_hours / 40.0, 1.0)
-        stress_multiplier = 1 + (upcoming_stress * 0.2)
-        
-        mental_load = min(base_load * stress_multiplier, 1.0)
-        stress_level = min(mental_load + (upcoming_stress * 0.1), 1.0)
-        
-        if stress_level > 0.8:
-            intensity = 0.3
-            capacity = 0.5
-        elif stress_level > 0.6:
-            intensity = 0.6
-            capacity = 0.7
-        else:
-            intensity = 0.8
-            capacity = 1.0
-        
-        return FatigueMetrics(
-            mental_load=mental_load,
-            stress_level=stress_level,
-            recommended_intensity=intensity,
-            weekly_capacity=capacity
-        )
-    
-    def create_adaptive_schedule(self, modules: List[StudyModule], events: List[LifeEvent], 
-                                fatigue: FatigueMetrics) -> List[Dict]:
-        """Create event-aware schedule"""
-        prompt = f"""
-        Create an adaptive study schedule considering:
-        
-        Modules: {[{'name': m.name, 'hours': m.estimated_hours, 'priority': m.priority} for m in modules]}
-        
-        Upcoming Events: {[{'name': e.name, 'date': e.date.strftime('%Y-%m-%d'), 'impact': e.impact_level} for e in events[:10]]}
-        
-        Fatigue Metrics:
-        - Mental Load: {fatigue.mental_load:.2f}
-        - Stress Level: {fatigue.stress_level:.2f}
-        - Recommended Intensity: {fatigue.recommended_intensity:.2f}
-        
-        Generate 30-day schedule in JSON format (ONLY respond with valid JSON):
-        {{
-            "schedule": [
-                {{
-                    "date": "YYYY-MM-DD",
-                    "module": "Module Name",
-                    "duration_hours": float,
-                    "intensity": float,
-                    "focus_topics": "Specific topics for this session",
-                    "scheduling_reason": "Why scheduled this way",
-                    "conflict_avoidance": "How conflicts were avoided"
-                }}
-            ]
-        }}
-        
-        Rules:
-        - Avoid high-impact event dates
-        - Reduce intensity during stress periods
-        - Prioritize modules by deadline and importance
-        - Use spaced repetition principles
-        
-        Start from: {datetime.now().strftime('%Y-%m-%d')}
-        """
-        
-        try:
-            response = self.model.generate_content(prompt)
-            json_data = self.extract_json(response.text)
-            
-            # Parse JSON response
-            parsed = json.loads(json_data)
-            
-            # Handle different response formats
-            if 'schedule' in parsed:
-                schedule_data = parsed['schedule']
-            elif isinstance(parsed, list):
-                schedule_data = parsed
-            else:
-                raise ValueError("Unexpected schedule format")
-            
-            schedule = []
-            for session in schedule_data:
-                try:
-                    schedule.append({
-                        'date': datetime.strptime(session['date'], '%Y-%m-%d'),
-                        'module': session['module'],
-                        'duration_hours': float(session['duration_hours']),
-                        'intensity': float(session['intensity']),
-                        'focus_topics': session['focus_topics'],
-                        'scheduling_reason': session['scheduling_reason'],
-                        'conflict_avoidance': session['conflict_avoidance']
-                    })
-                except (KeyError, ValueError) as e:
-                    st.error(f"Error parsing session: {str(e)}")
-                    continue
-            
-            return sorted(schedule, key=lambda x: x['date'])
-        except Exception as e:
-            st.error(f"Error creating schedule: {str(e)}")
-            if 'response' in locals():
-                st.text(f"Response content: {response.text[:500]}...")
-            return []
-    
-    def generate_adaptive_alerts(self, events: List[LifeEvent], schedule: List[Dict]) -> List[str]:
-        """Generate context-aware study alerts"""
-        alerts = []
-        upcoming_events = [e for e in events if 0 <= (e.date - datetime.now()).days <= 7]
-        
-        for event in upcoming_events:
-            if event.impact_level >= 4:
-                if event.event_type in ['exam', 'test', 'assignment']:
-                    alerts.append(f"🚨 {event.name} in {(event.date - datetime.now()).days} days - Switch to review mode, avoid new topics")
-                elif event.event_type in ['vacation', 'internship']:
-                    alerts.append(f"⚠️ {event.name} approaching - Complete current modules early, adjust schedule")
-                elif event.event_type in ['family', 'festival']:
-                    alerts.append(f"📅 {event.name} this week - Reduce study intensity, focus on light review")
-        
-        return alerts
 
-def parse_uploaded_events(uploaded_file) -> List[Dict]:
-    """Parse uploaded CSV/JSON events"""
-    try:
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-            # Ensure required columns exist
-            required_cols = ['name', 'date', 'event_type', 'impact_level']
-            for col in required_cols:
-                if col not in df.columns:
-                    st.error(f"Missing required column: {col}")
-                    return []
-                    
-            # Convert dates to string format if they're Timestamps
-            df['date'] = df['date'].astype(str)
-            if 'end_date' in df.columns:
-                df['end_date'] = df['end_date'].astype(str)
-            else:
-                df['end_date'] = df['date']
-                
-            # Fill missing description
-            if 'description' not in df.columns:
-                df['description'] = ""
-                
-            return df.to_dict('records')
-            
-        elif uploaded_file.name.endswith('.json'):
-            events = json.load(uploaded_file)
-            # Ensure proper format
-            for event in events:
-                if 'end_date' not in event:
-                    event['end_date'] = event['date']
-                if 'description' not in event:
-                    event['description'] = ""
-            return events
-            
-    except Exception as e:
-        st.error(f"Error parsing file: {str(e)}")
-    return []
+# ======================
+# MAIN APPLICATION
+# ======================
 
 def main():
     st.title("🎯 Life Event-Aware Study Planner")
@@ -455,8 +646,12 @@ def main():
         st.warning("Please provide Gemini API key to continue")
         st.stop()
     
-    # Initialize planner
-    planner = LifeEventStudyPlanner(api_key)
+    # Initialize agents
+    calendar_agent = CalendarSyncAgent()
+    cognitive_agent = CognitiveLoadEstimatorAgent()
+    schedule_agent = ScheduleOptimizerAgent(api_key)
+    rag_agent = PersonalizationFrameworkRetrieverAgent(api_key)
+    module_agent = StudyModuleGeneratorAgent(api_key)
     
     # Sidebar Configuration
     st.sidebar.header("📚 Study Profile")
@@ -507,11 +702,10 @@ def main():
     # Initialize RAG if not already done
     if uploaded_kb and st.session_state.rag_initialized is None:
         with st.spinner("🧠 Initializing RAG knowledge base..."):
-            rag_advisor = RAGStudyAdvisor(api_key)
-            qa_chain = rag_advisor.initialize_knowledge_base(uploaded_kb)
+            qa_chain = rag_agent.initialize_knowledge_base(uploaded_kb)
             if qa_chain:
                 st.session_state.rag_initialized = True
-                st.session_state.rag_advisor = rag_advisor
+                st.session_state.rag_agent = rag_agent
                 st.session_state.qa_chain = qa_chain
                 st.success("✅ RAG knowledge base initialized!")
             else:
@@ -534,14 +728,14 @@ def main():
         
         with st.spinner("🤖 AI generating adaptive study plan..."):
             # Generate modules
-            modules = planner.generate_study_modules(profile)
+            modules = module_agent.generate_study_modules(profile)
             
             # Get events
             events_data = []
             if uploaded_events:
-                events_data = parse_uploaded_events(uploaded_events)
+                events_data = calendar_agent.parse_uploaded_events(uploaded_events)
             else:
-                events_data = planner.generate_life_events(profile)
+                events_data = calendar_agent.generate_life_events(api_key, profile)
             
             events = []
             for event in events_data:
@@ -551,13 +745,13 @@ def main():
                     st.error(f"Error creating event: {str(e)}")
             
             # Calculate fatigue
-            fatigue = planner.calculate_fatigue_metrics(events, hours_per_week)
+            fatigue = cognitive_agent.calculate_fatigue_metrics(events, hours_per_week)
             
             # Create schedule
-            schedule = planner.create_adaptive_schedule(modules, events, fatigue)
+            schedule = schedule_agent.create_adaptive_schedule(modules, events, fatigue)
             
             # Generate alerts
-            alerts = planner.generate_adaptive_alerts(events, schedule)
+            alerts = schedule_agent.generate_adaptive_alerts(events, schedule)
             
             st.session_state.study_data = {
                 'modules': modules,
@@ -628,9 +822,9 @@ def main():
             
             # Upcoming events impact
             st.subheader("📅 Upcoming Events Impact")
-            for event in data['events'][:5]:
+            for event in data['events']:
                 days_until = (event.date - datetime.now()).days
-                if days_until >= 0:
+                if days_until >= 0 and days_until <= 14:  # Only show upcoming 2 weeks
                     impact_color = ["🟢", "🟡", "🟠", "🔴", "🚨"][min(event.impact_level-1, 4)]
                     st.write(f"{impact_color} **{event.name}** - {days_until} days away (Impact: {event.impact_level}/5)")
             
@@ -757,13 +951,11 @@ def main():
         - 🧠 **RAG Assistant**: Research-backed study advice (PDF-based)
         - 📊 **Fatigue Monitoring**: Adaptive workload management
         
-        ### How It Works:
-        1. **Upload PDFs** with study techniques/research
-        2. **Configure** your study profile in the sidebar
-        3. **Upload** your calendar events (optional) 
-        4. **Generate** your adaptive study plan
-        5. **Receive** smart alerts and adjustments
-        6. **Chat** with RAG assistant for personalized advice
+        ### Agents in Action:
+        1. **Calendar Sync Agent**: Parses academic/personal calendars
+        2. **Cognitive Load Estimator**: Evaluates fatigue and mental capacity
+        3. **Schedule Optimizer**: Dynamically reshuffles modules
+        4. **Personalization Framework**: Retrieves adaptive learning methods
         
         **Get started by uploading knowledge base PDFs and clicking 'Generate Adaptive Plan'!**
         """)
