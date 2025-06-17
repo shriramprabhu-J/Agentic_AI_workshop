@@ -4,16 +4,20 @@ import json
 import datetime
 from datetime import datetime, timedelta
 import plotly.express as px
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import google.generativeai as genai
 import re
+import tempfile
+import os
 from langchain.schema import Document
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, GoogleGenerativeAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from PyPDF2 import PdfReader
+import base64
 
 # Configure Streamlit
 st.set_page_config(
@@ -23,7 +27,7 @@ st.set_page_config(
 )
 
 # Initialize session state
-for key in ['study_data', 'events', 'chat_history', 'vector_store', 'qa_chain']:
+for key in ['study_data', 'events', 'chat_history', 'vector_store', 'qa_chain', 'rag_initialized']:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -41,11 +45,21 @@ class StudyModule:
 @dataclass
 class LifeEvent:
     name: str
-    date: datetime
-    end_date: datetime
+    date: str
+    end_date: str
     event_type: str
     impact_level: int
     description: str = ""
+    
+    def __post_init__(self):
+        # Convert date strings to datetime objects
+        if not isinstance(self.date, datetime):
+            self.date = datetime.strptime(self.date, '%Y-%m-%d')
+        if not isinstance(self.end_date, datetime):
+            if self.end_date:
+                self.end_date = datetime.strptime(self.end_date, '%Y-%m-%d')
+            else:
+                self.end_date = self.date
 
 @dataclass
 class FatigueMetrics:
@@ -68,55 +82,55 @@ class RAGStudyAdvisor:
         self.vector_store = None
         self.qa_chain = None
         
-    def initialize_knowledge_base(self):
-        """Initialize RAG with productivity and learning research"""
-        productivity_docs = [
-            "Spaced Repetition: Research shows reviewing material at increasing intervals (1 day, 3 days, 1 week, 2 weeks) improves long-term retention by 200-400%. Optimal for factual learning and vocabulary.",
+    def initialize_knowledge_base(self, pdf_files: List):
+        """Initialize RAG with uploaded PDF documents"""
+        if not pdf_files:
+            st.error("Please upload at least one PDF file for the knowledge base")
+            return None
             
-            "Pomodoro Technique: 25-minute focused work sessions followed by 5-minute breaks. Studies show this reduces mental fatigue and maintains consistent performance. Particularly effective for high-concentration tasks.",
-            
-            "Interleaving Practice: Mixing different types of problems or topics in a single study session improves problem-solving skills by 60%. More effective than blocked practice for complex subjects.",
-            
-            "Active Recall: Testing yourself without looking at notes activates retrieval pathways, strengthening memory. 40% more effective than passive reading for long-term retention.",
-            
-            "Cognitive Load Theory: Human working memory can handle 7±2 items simultaneously. Break complex topics into smaller chunks and use visual aids to reduce cognitive overload.",
-            
-            "Peak Performance Timing: Most people have 2-3 hour windows of peak cognitive performance. Schedule difficult tasks during these periods, typically 2-4 hours after waking.",
-            
-            "Fatigue Management: Mental fatigue accumulates after 45-90 minutes of focused work. Signs include decreased accuracy, slower processing, and reduced motivation. Recovery requires 15-30 minute breaks.",
-            
-            "Stress-Performance Curve: Moderate stress enhances performance, but high stress impairs learning. During high-stress periods (exams, deadlines), reduce cognitive load and focus on review rather than new learning.",
-            
-            "Context-Dependent Learning: Studying in varied environments improves recall flexibility. Change locations, times, and study methods to strengthen memory pathways.",
-            
-            "Sleep Consolidation: Memory consolidation occurs primarily during sleep. Studying before sleep and getting 7-9 hours improves retention by 20-40%.",
-            
-            "Exercise and Cognition: 20-30 minutes of moderate exercise before studying increases BDNF (brain-derived neurotrophic factor), improving learning capacity for 2-3 hours.",
-            
-            "Time Blocking: Dedicated time blocks for specific subjects reduce task-switching costs. Minimum 90-minute blocks for deep work, 30-minute blocks for review.",
-            
-            "Attention Restoration Theory: Natural environments restore directed attention capacity. 5-10 minute nature breaks between study sessions improve subsequent focus.",
-            
-            "Flow State Conditions: Clear goals, immediate feedback, and balanced challenge-skill ratio create flow states. Flow sessions are 3-5x more productive than regular study.",
-            
-            "Metacognitive Strategies: Self-questioning and reflection improve learning efficiency. Ask 'What do I know?', 'What don't I understand?', 'How can I apply this?' during study."
-        ]
+        documents = []
         
-        # Create documents
-        documents = [Document(page_content=doc) for doc in productivity_docs]
+        for pdf_file in pdf_files:
+            # Save to temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(pdf_file.read())
+                tmp_path = tmp.name
+            
+            try:
+                # Extract text from PDF
+                text = ""
+                reader = PdfReader(tmp_path)
+                for page in reader.pages:
+                    text += page.extract_text() + "\n"
+                
+                # Create document
+                documents.append(Document(page_content=text))
+            except Exception as e:
+                st.error(f"Error processing PDF: {str(e)}")
+            finally:
+                # Clean up temporary file
+                os.unlink(tmp_path)
         
+        if not documents:
+            st.error("No valid documents extracted from PDFs")
+            return None
+            
         # Split documents
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50
+            chunk_size=1000,
+            chunk_overlap=200
         )
         splits = text_splitter.split_documents(documents)
         
         # Create vector store
-        self.vector_store = FAISS.from_documents(splits, self.embeddings)
+        try:
+            self.vector_store = FAISS.from_documents(splits, self.embeddings)
+        except Exception as e:
+            st.error(f"Error creating vector store: {str(e)}")
+            return None
         
         # Create QA chain
-        template = """Use the following productivity research to answer the question about study planning:
+        template = """Use the following context to answer the question about study planning:
 
 Context: {context}
 
@@ -131,45 +145,70 @@ Answer:"""
             input_variables=["context", "question"]
         )
         
-        self.qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=self.vector_store.as_retriever(search_kwargs={"k": 3}),
-            chain_type_kwargs={"prompt": prompt}
-        )
-        
-        return self.qa_chain
+        try:
+            self.qa_chain = RetrievalQA.from_chain_type(
+                llm=self.llm,
+                chain_type="stuff",
+                retriever=self.vector_store.as_retriever(search_kwargs={"k": 5}),
+                chain_type_kwargs={"prompt": prompt}
+            )
+            return self.qa_chain
+        except Exception as e:
+            st.error(f"Error creating QA chain: {str(e)}")
+            return None
 
 class LifeEventStudyPlanner:
     def __init__(self, api_key: str):
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-1.5-flash')
-        self.rag_advisor = RAGStudyAdvisor(api_key)
         
     def extract_json(self, text: str) -> str:
-        """Extract JSON from AI response"""
+        """Robust JSON extraction from AI response"""
+        # Clean response text
+        text = text.strip().replace('\\"', '"').replace('\\n', '')
+        
+        # First try to parse the entire text as JSON
         try:
             json.loads(text)
             return text
-        except:
-            pattern = r'```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```'
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                return match.group(1)
+        except json.JSONDecodeError:
+            pass
             
-            for char in ['{', '[']:
-                start = text.find(char)
-                if start != -1:
-                    end = text.rfind('}' if char == '{' else ']')
-                    if end > start:
-                        try:
-                            candidate = text[start:end+1]
-                            json.loads(candidate)
-                            return candidate
-                        except:
-                            continue
-            return "[]"
-    
+        # Try to find JSON objects using multiple strategies
+        patterns = [
+            r'```json\s*({.*?})\s*```',  # Markdown code block
+            r'```\s*({.*?})\s*```',       # Generic code block
+            r'({.*})',                     # Simple curly braces
+            r'(\[.*\])'                    # Array format
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.DOTALL)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match = match[0]  # Handle capture groups
+                try:
+                    # Try to parse as JSON
+                    parsed = json.loads(match)
+                    return json.dumps(parsed)  # Return valid JSON string
+                except json.JSONDecodeError:
+                    # Attempt to fix common issues
+                    try:
+                        # Remove trailing commas
+                        fixed = re.sub(r',\s*([}\]])', r'\1', match)
+                        # Replace single quotes with double quotes
+                        fixed = fixed.replace("'", '"')
+                        # Fix unescaped quotes
+                        fixed = re.sub(r'(?<!\\)"', r'\"', fixed)
+                        parsed = json.loads(fixed)
+                        return json.dumps(parsed)
+                    except:
+                        continue
+        
+        # Final fallback - return empty schedule
+        st.warning("Could not extract valid JSON from response. Using empty schedule.")
+        return '{"schedule": []}'
+
     def generate_study_modules(self, profile: Dict) -> List[StudyModule]:
         """Generate AI-powered study modules"""
         prompt = f"""
@@ -190,6 +229,7 @@ class LifeEventStudyPlanner:
         ]
         
         Ensure realistic time allocation and progressive difficulty.
+        Return ONLY the JSON array.
         """
         
         try:
@@ -211,7 +251,7 @@ class LifeEventStudyPlanner:
             
             return modules
         except Exception as e:
-            st.error(f"Error generating modules: {e}")
+            st.error(f"Error generating modules: {str(e)}")
             return []
     
     def generate_life_events(self, profile: Dict) -> List[Dict]:
@@ -220,7 +260,7 @@ class LifeEventStudyPlanner:
         Generate realistic life events for a {profile['level']} {profile['field']} student
         over {profile['duration_weeks']} weeks.
         
-        Include academic, personal, and professional events in JSON:
+        Include academic, personal, and professional events in JSON format:
         [
             {{
                 "name": "Event Name",
@@ -234,6 +274,7 @@ class LifeEventStudyPlanner:
         
         Make events realistic and varied in impact.
         Start from: {datetime.now().strftime('%Y-%m-%d')}
+        Return ONLY the JSON array.
         """
         
         try:
@@ -241,7 +282,7 @@ class LifeEventStudyPlanner:
             json_data = self.extract_json(response.text)
             return json.loads(json_data)
         except Exception as e:
-            st.error(f"Error generating events: {e}")
+            st.error(f"Error generating events: {str(e)}")
             return []
     
     def calculate_fatigue_metrics(self, events: List[LifeEvent], study_hours: float) -> FatigueMetrics:
@@ -273,7 +314,7 @@ class LifeEventStudyPlanner:
         )
     
     def create_adaptive_schedule(self, modules: List[StudyModule], events: List[LifeEvent], 
-                               fatigue: FatigueMetrics) -> List[Dict]:
+                                fatigue: FatigueMetrics) -> List[Dict]:
         """Create event-aware schedule"""
         prompt = f"""
         Create an adaptive study schedule considering:
@@ -287,18 +328,20 @@ class LifeEventStudyPlanner:
         - Stress Level: {fatigue.stress_level:.2f}
         - Recommended Intensity: {fatigue.recommended_intensity:.2f}
         
-        Generate 30-day schedule in JSON:
-        [
-            {{
-                "date": "YYYY-MM-DD",
-                "module": "Module Name",
-                "duration_hours": float,
-                "intensity": float,
-                "focus_topics": "Specific topics for this session",
-                "scheduling_reason": "Why scheduled this way",
-                "conflict_avoidance": "How conflicts were avoided"
-            }}
-        ]
+        Generate 30-day schedule in JSON format (ONLY respond with valid JSON):
+        {{
+            "schedule": [
+                {{
+                    "date": "YYYY-MM-DD",
+                    "module": "Module Name",
+                    "duration_hours": float,
+                    "intensity": float,
+                    "focus_topics": "Specific topics for this session",
+                    "scheduling_reason": "Why scheduled this way",
+                    "conflict_avoidance": "How conflicts were avoided"
+                }}
+            ]
+        }}
         
         Rules:
         - Avoid high-impact event dates
@@ -312,23 +355,39 @@ class LifeEventStudyPlanner:
         try:
             response = self.model.generate_content(prompt)
             json_data = self.extract_json(response.text)
-            schedule_data = json.loads(json_data)
+            
+            # Parse JSON response
+            parsed = json.loads(json_data)
+            
+            # Handle different response formats
+            if 'schedule' in parsed:
+                schedule_data = parsed['schedule']
+            elif isinstance(parsed, list):
+                schedule_data = parsed
+            else:
+                raise ValueError("Unexpected schedule format")
             
             schedule = []
             for session in schedule_data:
-                schedule.append({
-                    'date': datetime.strptime(session['date'], '%Y-%m-%d'),
-                    'module': session['module'],
-                    'duration_hours': session['duration_hours'],
-                    'intensity': session['intensity'],
-                    'focus_topics': session['focus_topics'],
-                    'scheduling_reason': session['scheduling_reason'],
-                    'conflict_avoidance': session['conflict_avoidance']
-                })
+                try:
+                    schedule.append({
+                        'date': datetime.strptime(session['date'], '%Y-%m-%d'),
+                        'module': session['module'],
+                        'duration_hours': float(session['duration_hours']),
+                        'intensity': float(session['intensity']),
+                        'focus_topics': session['focus_topics'],
+                        'scheduling_reason': session['scheduling_reason'],
+                        'conflict_avoidance': session['conflict_avoidance']
+                    })
+                except (KeyError, ValueError) as e:
+                    st.error(f"Error parsing session: {str(e)}")
+                    continue
             
             return sorted(schedule, key=lambda x: x['date'])
         except Exception as e:
-            st.error(f"Error creating schedule: {e}")
+            st.error(f"Error creating schedule: {str(e)}")
+            if 'response' in locals():
+                st.text(f"Response content: {response.text[:500]}...")
             return []
     
     def generate_adaptive_alerts(self, events: List[LifeEvent], schedule: List[Dict]) -> List[str]:
@@ -352,38 +411,52 @@ def parse_uploaded_events(uploaded_file) -> List[Dict]:
     try:
         if uploaded_file.name.endswith('.csv'):
             df = pd.read_csv(uploaded_file)
-            # Convert date strings to datetime
-            df['date'] = pd.to_datetime(df['date'])
-            df['end_date'] = pd.to_datetime(df['end_date'])
+            # Ensure required columns exist
+            required_cols = ['name', 'date', 'event_type', 'impact_level']
+            for col in required_cols:
+                if col not in df.columns:
+                    st.error(f"Missing required column: {col}")
+                    return []
+                    
+            # Convert dates to string format if they're Timestamps
+            df['date'] = df['date'].astype(str)
+            if 'end_date' in df.columns:
+                df['end_date'] = df['end_date'].astype(str)
+            else:
+                df['end_date'] = df['date']
+                
+            # Fill missing description
+            if 'description' not in df.columns:
+                df['description'] = ""
+                
             return df.to_dict('records')
+            
         elif uploaded_file.name.endswith('.json'):
             events = json.load(uploaded_file)
-            # Convert date strings to datetime
+            # Ensure proper format
             for event in events:
-                event['date'] = datetime.strptime(event['date'], '%Y-%m-%d')
-                event['end_date'] = datetime.strptime(event['end_date'], '%Y-%m-%d')
+                if 'end_date' not in event:
+                    event['end_date'] = event['date']
+                if 'description' not in event:
+                    event['description'] = ""
             return events
+            
     except Exception as e:
-        st.error(f"Error parsing file: {e}")
+        st.error(f"Error parsing file: {str(e)}")
     return []
+
 def main():
     st.title("🎯 Life Event-Aware Study Planner")
     st.markdown("### Adaptive AI Study Planning with RAG-Powered Insights")
     
     # API Key
-    api_key = st.secrets.get("GEMINI_API_KEY") or st.sidebar.text_input("Gemini API Key", type="password")
+    api_key = st.secrets.get("GEMINI_API_KEY", None) or st.sidebar.text_input("Gemini API Key", type="password")
     if not api_key:
-        st.error("Please provide Gemini API key")
+        st.warning("Please provide Gemini API key to continue")
         st.stop()
     
     # Initialize planner
-    @st.cache_resource
-    def get_planner():
-        planner = LifeEventStudyPlanner(api_key)
-        planner.rag_advisor.initialize_knowledge_base()
-        return planner
-    
-    planner = get_planner()
+    planner = LifeEventStudyPlanner(api_key)
     
     # Sidebar Configuration
     st.sidebar.header("📚 Study Profile")
@@ -393,9 +466,22 @@ def main():
     duration_weeks = st.sidebar.slider("Duration (weeks)", 4, 20, 12)
     goals = st.sidebar.text_area("Goals", "Master key concepts and build projects")
     
+    # Knowledge Base Upload
+    st.sidebar.header("🧠 Knowledge Base")
+    uploaded_kb = st.sidebar.file_uploader(
+        "Upload PDF Knowledge Base", 
+        type=['pdf'], 
+        accept_multiple_files=True,
+        help="Upload PDFs with study techniques and productivity research"
+    )
+    
     # Event Upload
     st.sidebar.header("📅 Life Events")
-    uploaded_file = st.sidebar.file_uploader("Upload Events (CSV/JSON)", type=['csv', 'json'])
+    uploaded_events = st.sidebar.file_uploader(
+        "Upload Events (CSV/JSON)", 
+        type=['csv', 'json'], 
+        accept_multiple_files=False
+    )
     
     # Sample CSV download
     sample_data = pd.DataFrame({
@@ -407,7 +493,8 @@ def main():
                     (datetime.now() + timedelta(days=21)).strftime('%Y-%m-%d'),
                     (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')],
         'event_type': ['exam', 'festival', 'work'],
-        'impact_level': [5, 3, 4]
+        'impact_level': [5, 3, 4],
+        'description': ['Important semester exams', 'Family celebration time', 'Final round interview']
     })
     
     st.sidebar.download_button(
@@ -417,8 +504,26 @@ def main():
         "text/csv"
     )
     
+    # Initialize RAG if not already done
+    if uploaded_kb and st.session_state.rag_initialized is None:
+        with st.spinner("🧠 Initializing RAG knowledge base..."):
+            rag_advisor = RAGStudyAdvisor(api_key)
+            qa_chain = rag_advisor.initialize_knowledge_base(uploaded_kb)
+            if qa_chain:
+                st.session_state.rag_initialized = True
+                st.session_state.rag_advisor = rag_advisor
+                st.session_state.qa_chain = qa_chain
+                st.success("✅ RAG knowledge base initialized!")
+            else:
+                st.error("❌ Failed to initialize knowledge base")
+    
     # Generate Plan
-    if st.sidebar.button("🚀 Generate Adaptive Plan", type="primary"):
+    if st.sidebar.button("🚀 Generate Adaptive Plan", type="primary", use_container_width=True):
+        # Check RAG initialization
+        if not st.session_state.get('rag_initialized'):
+            st.error("Please upload knowledge base PDFs first")
+            return
+            
         profile = {
             'field': field,
             'level': level,
@@ -432,12 +537,18 @@ def main():
             modules = planner.generate_study_modules(profile)
             
             # Get events
-            if uploaded_file:
-                events_data = parse_uploaded_events(uploaded_file)
+            events_data = []
+            if uploaded_events:
+                events_data = parse_uploaded_events(uploaded_events)
             else:
                 events_data = planner.generate_life_events(profile)
             
-            events = [LifeEvent(**event) for event in events_data]
+            events = []
+            for event in events_data:
+                try:
+                    events.append(LifeEvent(**event))
+                except Exception as e:
+                    st.error(f"Error creating event: {str(e)}")
             
             # Calculate fatigue
             fatigue = planner.calculate_fatigue_metrics(events, hours_per_week)
@@ -459,7 +570,7 @@ def main():
             st.success("✅ Adaptive study plan generated!")
     
     # Main Interface
-    if st.session_state.study_data:
+    if st.session_state.get('study_data'):
         tab1, tab2, tab3, tab4 = st.tabs(["📅 Schedule", "⚡ Alerts", "📊 Analytics", "🤖 RAG Assistant"])
         
         with tab1:
@@ -486,7 +597,7 @@ def main():
                     }
                     for s in data['schedule'][:14]
                 ])
-                st.dataframe(schedule_df, use_container_width=True)
+                st.dataframe(schedule_df, use_container_width=True, hide_index=True)
                 
                 # Timeline chart
                 fig = px.timeline(
@@ -498,6 +609,8 @@ def main():
                     title="Adaptive Study Timeline"
                 )
                 st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("No schedule generated")
         
         with tab2:
             st.header("⚡ Smart Alerts & Adjustments")
@@ -507,11 +620,11 @@ def main():
             # Fatigue metrics
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Mental Load", f"{data['fatigue'].mental_load:.0%}")
+                st.metric("Mental Load", f"{data['fatigue'].mental_load:.0%}", help="Current cognitive workload")
             with col2:
-                st.metric("Stress Level", f"{data['fatigue'].stress_level:.0%}")
+                st.metric("Stress Level", f"{data['fatigue'].stress_level:.0%}", help="Current stress indicators")
             with col3:
-                st.metric("Capacity", f"{data['fatigue'].weekly_capacity:.0%}")
+                st.metric("Capacity", f"{data['fatigue'].weekly_capacity:.0%}", help="Available weekly study capacity")
             
             # Upcoming events impact
             st.subheader("📅 Upcoming Events Impact")
@@ -522,12 +635,22 @@ def main():
                     st.write(f"{impact_color} **{event.name}** - {days_until} days away (Impact: {event.impact_level}/5)")
             
             # Dynamic recommendations
+            st.subheader("📝 Adaptive Recommendations")
             if data['fatigue'].stress_level > 0.7:
                 st.error("🚨 High stress detected - Consider lighter study methods and more breaks")
+                st.markdown("- Focus on review rather than new material")
+                st.markdown("- Use Pomodoro technique with shorter sessions")
+                st.markdown("- Prioritize sleep and recovery activities")
             elif data['fatigue'].stress_level > 0.5:
                 st.warning("⚠️ Moderate stress - Focus on review over new learning")
+                st.markdown("- Use active recall techniques")
+                st.markdown("- Take frequent short breaks")
+                st.markdown("- Consider light exercise between sessions")
             else:
                 st.success("✅ Good capacity for deep learning sessions")
+                st.markdown("- Tackle difficult topics during peak hours")
+                st.markdown("- Try interleaving different subjects")
+                st.markdown("- Experiment with new learning techniques")
         
         with tab3:
             st.header("📊 Learning Analytics")
@@ -546,51 +669,59 @@ def main():
                 for m in data['modules']
             ])
             
-            fig = px.scatter(
-                modules_df,
-                x='Hours',
-                y='Priority',
-                size='Difficulty',
-                color='Module',
-                title="Module Priority vs Time Investment"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Weekly workload
-            if data['schedule']:
-                schedule_df = pd.DataFrame(data['schedule'])
-                schedule_df['week'] = schedule_df['date'].dt.isocalendar().week
-                weekly_hours = schedule_df.groupby('week')['duration_hours'].sum().reset_index()
-                
-                fig = px.bar(weekly_hours, x='week', y='duration_hours', title="Weekly Study Hours")
+            if not modules_df.empty:
+                fig = px.scatter(
+                    modules_df,
+                    x='Hours',
+                    y='Priority',
+                    size='Difficulty',
+                    color='Module',
+                    title="Module Priority vs Time Investment",
+                    hover_data=['Deadline']
+                )
                 st.plotly_chart(fig, use_container_width=True)
+                
+                # Weekly workload
+                if data['schedule']:
+                    schedule_df = pd.DataFrame(data['schedule'])
+                    schedule_df['date'] = pd.to_datetime(schedule_df['date'])
+                    schedule_df['week'] = schedule_df['date'].dt.isocalendar().week
+                    weekly_hours = schedule_df.groupby('week')['duration_hours'].sum().reset_index()
+                    
+                    fig = px.bar(weekly_hours, x='week', y='duration_hours', 
+                                title="Weekly Study Hours", labels={'duration_hours': 'Hours'})
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("No modules data available")
         
         with tab4:
             st.header("🤖 RAG-Powered Study Assistant")
             
+            # Initialize chat history
+            if st.session_state.chat_history is None:
+                st.session_state.chat_history = []
+            
             # Display chat history
-            if st.session_state.chat_history:
-                for msg in st.session_state.chat_history:
-                    st.chat_message(msg['role']).write(msg['content'])
+            for msg in st.session_state.chat_history:
+                if msg['role'] == 'user':
+                    st.chat_message("user").write(msg['content'])
+                else:
+                    st.chat_message("assistant").write(msg['content'])
             
             # Chat input with RAG
             if question := st.chat_input("Ask about study strategies, scheduling, or productivity..."):
                 st.chat_message("user").write(question)
-                
-                if st.session_state.chat_history is None:
-                    st.session_state.chat_history = []
-                
                 st.session_state.chat_history.append({"role": "user", "content": question})
                 
                 with st.spinner("🧠 Consulting research database..."):
                     try:
                         # Get RAG response
-                        answer = planner.rag_advisor.qa_chain.run(question)
+                        answer = st.session_state.qa_chain.run(question)
                         
                         st.chat_message("assistant").write(answer)
                         st.session_state.chat_history.append({"role": "assistant", "content": answer})
                     except Exception as e:
-                        error_msg = f"I apologize, there was an error: {e}"
+                        error_msg = f"I apologize, there was an error: {str(e)}"
                         st.chat_message("assistant").write(error_msg)
                         st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
             
@@ -603,11 +734,16 @@ def main():
                 "Best practices for spaced repetition?"
             ]
             
-            for q in quick_questions:
-                if st.button(q, key=f"quick_{q[:20]}"):
-                    with st.spinner("Searching research..."):
-                        answer = planner.rag_advisor.qa_chain.run(q)
-                        st.info(f"**Q:** {q}\n\n**A:** {answer}")
+            cols = st.columns(2)
+            for i, q in enumerate(quick_questions):
+                with cols[i % 2]:
+                    if st.button(q, key=f"quick_{q[:20]}", use_container_width=True):
+                        with st.spinner("Searching research..."):
+                            try:
+                                answer = st.session_state.qa_chain.run(q)
+                                st.info(f"**Q:** {q}\n\n**A:** {answer}")
+                            except:
+                                st.error("Error retrieving answer")
     
     else:
         # Welcome screen
@@ -618,17 +754,18 @@ def main():
         - 📚 **AI-Generated Study Modules**: Tailored to your field and level
         - 📅 **Event-Aware Scheduling**: Automatically adjusts for life events
         - ⚡ **Smart Alerts**: Proactive notifications for schedule conflicts
-        - 🧠 **RAG Assistant**: Research-backed study advice
+        - 🧠 **RAG Assistant**: Research-backed study advice (PDF-based)
         - 📊 **Fatigue Monitoring**: Adaptive workload management
         
         ### How It Works:
-        1. **Configure** your study profile in the sidebar
-        2. **Upload** your calendar events (optional) 
-        3. **Generate** your adaptive study plan
-        4. **Receive** smart alerts and adjustments
-        5. **Chat** with RAG assistant for personalized advice
+        1. **Upload PDFs** with study techniques/research
+        2. **Configure** your study profile in the sidebar
+        3. **Upload** your calendar events (optional) 
+        4. **Generate** your adaptive study plan
+        5. **Receive** smart alerts and adjustments
+        6. **Chat** with RAG assistant for personalized advice
         
-        **Get started by filling out your study profile and clicking "Generate Adaptive Plan"!**
+        **Get started by uploading knowledge base PDFs and clicking 'Generate Adaptive Plan'!**
         """)
 
 if __name__ == "__main__":
