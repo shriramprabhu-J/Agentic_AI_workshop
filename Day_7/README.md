@@ -129,4 +129,4 @@ This system is an example of a practical, production-ready LangChain agent imple
 
 ---
 
-For any further questions, see `hack.py` or open an issue!
+For any further questions, see `app.py` or open an issue!
