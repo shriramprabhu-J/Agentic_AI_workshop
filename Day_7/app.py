@@ -5,16 +5,17 @@ import datetime
 from datetime import datetime, timedelta
 import plotly.express as px
 from typing import Dict, List, Any, Optional, Tuple
-import google.generativeai as genai
 import re
 import tempfile
 import os
-from langchain.schema import Document
+from langchain.schema import Document, SystemMessage, HumanMessage
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, GoogleGenerativeAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from langchain.agents import AgentExecutor, Tool, create_react_agent
+from langchain import hub
 from dataclasses import dataclass, asdict, field
 from PyPDF2 import PdfReader
 import base64
@@ -28,7 +29,7 @@ st.set_page_config(
 )
 
 # Initialize session state
-for key in ['study_data', 'events', 'chat_history', 'vector_store', 'qa_chain', 'rag_initialized']:
+for key in ['study_data', 'events', 'chat_history', 'vector_store', 'qa_chain', 'rag_initialized', 'agent_executor']:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -53,7 +54,6 @@ class LifeEvent:
     description: str = ""
     
     def __post_init__(self):
-        # Convert date strings to datetime objects
         if not isinstance(self.date, datetime):
             try:
                 self.date = datetime.strptime(self.date, '%Y-%m-%d')
@@ -84,25 +84,21 @@ class CalendarSyncAgent:
     """Parses academic calendars and personal events from CSV/JSON"""
     @staticmethod
     def parse_uploaded_events(uploaded_file) -> List[Dict]:
-        """Parse uploaded CSV/JSON events"""
         try:
             if uploaded_file.name.endswith('.csv'):
                 df = pd.read_csv(uploaded_file)
-                # Ensure required columns exist
                 required_cols = ['name', 'date', 'event_type', 'impact_level']
                 for col in required_cols:
                     if col not in df.columns:
                         st.error(f"Missing required column: {col}")
                         return []
                         
-                # Convert dates to string format if they're Timestamps
                 df['date'] = df['date'].astype(str)
                 if 'end_date' in df.columns:
                     df['end_date'] = df['end_date'].astype(str)
                 else:
                     df['end_date'] = df['date']
                     
-                # Fill missing description
                 if 'description' not in df.columns:
                     df['description'] = ""
                     
@@ -110,7 +106,6 @@ class CalendarSyncAgent:
                 
             elif uploaded_file.name.endswith('.json'):
                 events = json.load(uploaded_file)
-                # Ensure proper format
                 for event in events:
                     if 'end_date' not in event:
                         event['end_date'] = event['date']
@@ -124,9 +119,7 @@ class CalendarSyncAgent:
     
     @staticmethod
     def generate_life_events(api_key: str, profile: Dict) -> List[Dict]:
-        """Generate realistic life events using AI"""
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        llm = GoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
         
         prompt = f"""
         Generate realistic life events for a {profile['level']} {profile['field']} student
@@ -150,8 +143,8 @@ class CalendarSyncAgent:
         """
         
         try:
-            response = model.generate_content(prompt)
-            json_data = PersonalizationFrameworkRetrieverAgent.extract_json(response.text)
+            response = llm.invoke(prompt)
+            json_data = PersonalizationFrameworkRetrieverAgent.extract_json(response)
             return json.loads(json_data)
         except Exception as e:
             st.error(f"Error generating events: {str(e)}")
@@ -161,31 +154,23 @@ class CognitiveLoadEstimatorAgent:
     """Evaluates recent activity and fatigue indicators"""
     @staticmethod
     def calculate_fatigue_metrics(events: List[LifeEvent], study_hours: float) -> FatigueMetrics:
-        """Calculate fatigue metrics based on events and study load"""
-        # Filter events that are relevant (within next 2 weeks)
         relevant_events = [
             e for e in events 
             if datetime.now() <= e.date <= (datetime.now() + timedelta(days=14))
         ]
         
-        # Calculate event impact score
         impact_score = sum(
             min(5, max(1, e.impact_level)) * 
             (1 - (e.date - datetime.now()).days / 14)
             for e in relevant_events
         )
         
-        # Normalize impact score (0-1 scale)
         normalized_impact = min(1.0, impact_score / 15.0)
-        
-        # Calculate base load based on study hours
         base_load = min(study_hours / 40.0, 1.0)
         
-        # Calculate metrics
         mental_load = min(0.95, base_load + (normalized_impact * 0.3))
         stress_level = min(0.95, base_load * 0.6 + normalized_impact * 0.4)
         
-        # Determine recommendations based on stress level
         if stress_level > 0.7:
             intensity = 0.4
             capacity = 0.5
@@ -206,62 +191,48 @@ class CognitiveLoadEstimatorAgent:
 class ScheduleOptimizerAgent:
     """Dynamically reshuffles modules and recommends adjustments"""
     def __init__(self, api_key: str):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.llm = GoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
     
     @staticmethod
     def extract_json(text: str) -> str:
-        """Robust JSON extraction from AI response"""
-        # Clean response text
         text = text.strip().replace('\\"', '"').replace('\\n', '')
         
-        # First try to parse the entire text as JSON
         try:
             json.loads(text)
             return text
         except json.JSONDecodeError:
             pass
             
-        # Try to find JSON objects using multiple strategies
         patterns = [
-            r'```json\s*({.*?})\s*```',  # Markdown code block
-            r'```\s*({.*?})\s*```',       # Generic code block
-            r'({.*})',                     # Simple curly braces
-            r'(\[.*\])'                    # Array format
+            r'```json\s*({.*?})\s*```',
+            r'```\s*({.*?})\s*```',
+            r'({.*})',
+            r'(\[.*\])'
         ]
         
         for pattern in patterns:
             matches = re.findall(pattern, text, re.DOTALL)
             for match in matches:
                 if isinstance(match, tuple):
-                    match = match[0]  # Handle capture groups
+                    match = match[0]
                 try:
-                    # Try to parse as JSON
                     parsed = json.loads(match)
-                    return json.dumps(parsed)  # Return valid JSON string
+                    return json.dumps(parsed)
                 except json.JSONDecodeError:
-                    # Attempt to fix common issues
                     try:
-                        # Remove trailing commas
                         fixed = re.sub(r',\s*([}\]])', r'\1', match)
-                        # Replace single quotes with double quotes
                         fixed = fixed.replace("'", '"')
-                        # Fix unescaped quotes
                         fixed = re.sub(r'(?<!\\)"', r'\"', fixed)
                         parsed = json.loads(fixed)
                         return json.dumps(parsed)
                     except:
                         continue
         
-        # Final fallback - return empty schedule
         st.warning("Could not extract valid JSON from response. Using empty schedule.")
         return '{"schedule": []}'
 
     def create_adaptive_schedule(self, modules: List[StudyModule], events: List[LifeEvent], 
                                 fatigue: FatigueMetrics) -> List[Dict]:
-        """Create event-aware schedule"""
-        # FIXED: Removed extra bracket in the events list comprehension
-        # Create a filtered list of upcoming events
         upcoming_events = [
             {'name': e.name, 'date': e.date.strftime('%Y-%m-%d'), 'impact': e.impact_level} 
             for e in events 
@@ -305,13 +276,11 @@ class ScheduleOptimizerAgent:
         """
         
         try:
-            response = self.model.generate_content(prompt)
-            json_data = self.extract_json(response.text)
+            response = self.llm.invoke(prompt)
+            json_data = self.extract_json(response)
             
-            # Parse JSON response
             parsed = json.loads(json_data)
             
-            # Handle different response formats
             if 'schedule' in parsed:
                 schedule_data = parsed['schedule']
             elif isinstance(parsed, list):
@@ -339,11 +308,10 @@ class ScheduleOptimizerAgent:
         except Exception as e:
             st.error(f"Error creating schedule: {str(e)}")
             if 'response' in locals():
-                st.text(f"Response content: {response.text[:500]}...")
+                st.text(f"Response content: {response[:500]}...")
             return []
     
     def generate_adaptive_alerts(self, events: List[LifeEvent], schedule: List[Dict]) -> List[str]:
-        """Generate context-aware study alerts"""
         alerts = []
         upcoming_events = [e for e in events if 0 <= (e.date - datetime.now()).days <= 7]
         
@@ -356,7 +324,6 @@ class ScheduleOptimizerAgent:
                 elif event.event_type in ['family', 'festival']:
                     alerts.append(f"📅 {event.name} this week - Reduce study intensity, focus on light review")
         
-        # Add fatigue-based alerts
         daily_hours = {}
         for session in schedule:
             date_str = session['date'].strftime('%Y-%m-%d')
@@ -388,66 +355,53 @@ class PersonalizationFrameworkRetrieverAgent:
     
     @staticmethod
     def extract_json(text: str) -> str:
-        """Robust JSON extraction from AI response"""
-        # Clean response text
         text = text.strip().replace('\\"', '"').replace('\\n', '')
         
-        # First try to parse the entire text as JSON
         try:
             json.loads(text)
             return text
         except json.JSONDecodeError:
             pass
             
-        # Try to find JSON objects using multiple strategies
         patterns = [
-            r'```json\s*({.*?})\s*```',  # Markdown code block
-            r'```\s*({.*?})\s*```',       # Generic code block
-            r'({.*})',                     # Simple curly braces
-            r'(\[.*\])'                    # Array format
+            r'```json\s*({.*?})\s*```',
+            r'```\s*({.*?})\s*```',
+            r'({.*})',
+            r'(\[.*\])'
         ]
         
         for pattern in patterns:
             matches = re.findall(pattern, text, re.DOTALL)
             for match in matches:
                 if isinstance(match, tuple):
-                    match = match[0]  # Handle capture groups
+                    match = match[0]
                 try:
-                    # Try to parse as JSON
                     parsed = json.loads(match)
-                    return json.dumps(parsed)  # Return valid JSON string
+                    return json.dumps(parsed)
                 except json.JSONDecodeError:
-                    # Attempt to fix common issues
                     try:
-                        # Remove trailing commas
                         fixed = re.sub(r',\s*([}\]])', r'\1', match)
-                        # Replace single quotes with double quotes
                         fixed = fixed.replace("'", '"')
-                        # Fix unescaped quotes
                         fixed = re.sub(r'(?<!\\)"', r'\"', fixed)
                         parsed = json.loads(fixed)
                         return json.dumps(parsed)
                     except:
                         continue
         
-        # Final fallback - return empty schedule
         st.warning("Could not extract valid JSON from response. Using empty schedule.")
         return '{"schedule": []}'
 
     def initialize_knowledge_base(self, pdf_files: List):
-        """Initialize RAG with static PDF + user-uploaded PDF documents"""
         if not pdf_files:
             st.error("Please upload at least one PDF file to combine with our knowledge base")
             return None
         
         documents = []
     
-        # 1. Process STATIC PDF
         try:
-            static_pdf_path = "E:\Agentic_AI_workshop\Day_7\Adaptive_learning_productivity_strategies.pdf"
+            static_pdf_path = "E:\RAG\Adaptive_learning_productivity_strategies.pdf"
             file_hash = hashlib.md5(static_pdf_path.encode()).hexdigest()
             
-            # Only process if not already in knowledge base
             if file_hash not in self.file_hashes:
                 static_reader = PdfReader(static_pdf_path)
                 static_text = ""
@@ -459,9 +413,7 @@ class PersonalizationFrameworkRetrieverAgent:
             st.error(f"Error loading static knowledge base: {str(e)}")
             return None
 
-        # 2. Process USER-UPLOADED PDFs
         for pdf_file in pdf_files:
-            # Calculate file hash to avoid duplicates
             file_hash = hashlib.md5(pdf_file.getvalue()).hexdigest()
             
             if file_hash in self.file_hashes:
@@ -487,14 +439,12 @@ class PersonalizationFrameworkRetrieverAgent:
             st.info("All documents already processed in knowledge base")
             return self.qa_chain
         
-        # Split documents
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200
         )
         splits = text_splitter.split_documents(documents)
     
-        # Create or update vector store
         try:
             if self.vector_store is None:
                 self.vector_store = FAISS.from_documents(splits, self.embeddings)
@@ -504,7 +454,6 @@ class PersonalizationFrameworkRetrieverAgent:
             st.error(f"Error creating vector database: {str(e)}")
             return None
     
-        # Create QA chain
         template = """Use the following context to answer the question about study planning:
 
 Context: {context}
@@ -536,59 +485,47 @@ Answer:"""
 class StudyModuleGeneratorAgent:
     """Generates study modules based on user profile"""
     def __init__(self, api_key: str):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.llm = GoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
     
     @staticmethod
     def extract_json(text: str) -> str:
-        """Robust JSON extraction from AI response"""
-        # Clean response text
         text = text.strip().replace('\\"', '"').replace('\\n', '')
         
-        # First try to parse the entire text as JSON
         try:
             json.loads(text)
             return text
         except json.JSONDecodeError:
             pass
             
-        # Try to find JSON objects using multiple strategies
         patterns = [
-            r'```json\s*({.*?})\s*```',  # Markdown code block
-            r'```\s*({.*?})\s*```',       # Generic code block
-            r'({.*})',                     # Simple curly braces
-            r'(\[.*\])'                    # Array format
+            r'```json\s*({.*?})\s*```',
+            r'```\s*({.*?})\s*```',
+            r'({.*})',
+            r'(\[.*\])'
         ]
         
         for pattern in patterns:
             matches = re.findall(pattern, text, re.DOTALL)
             for match in matches:
                 if isinstance(match, tuple):
-                    match = match[0]  # Handle capture groups
+                    match = match[0]
                 try:
-                    # Try to parse as JSON
                     parsed = json.loads(match)
-                    return json.dumps(parsed)  # Return valid JSON string
+                    return json.dumps(parsed)
                 except json.JSONDecodeError:
-                    # Attempt to fix common issues
                     try:
-                        # Remove trailing commas
                         fixed = re.sub(r',\s*([}\]])', r'\1', match)
-                        # Replace single quotes with double quotes
                         fixed = fixed.replace("'", '"')
-                        # Fix unescaped quotes
                         fixed = re.sub(r'(?<!\\)"', r'\"', fixed)
                         parsed = json.loads(fixed)
                         return json.dumps(parsed)
                     except:
                         continue
         
-        # Final fallback - return empty schedule
         st.warning("Could not extract valid JSON from response. Using empty schedule.")
         return '{"schedule": []}'
 
     def generate_study_modules(self, profile: Dict) -> List[StudyModule]:
-        """Generate AI-powered study modules"""
         prompt = f"""
         Generate study modules for: {profile['field']} (Level: {profile['level']})
         Available: {profile['hours_per_week']} hours/week for {profile['duration_weeks']} weeks
@@ -611,8 +548,8 @@ class StudyModuleGeneratorAgent:
         """
         
         try:
-            response = self.model.generate_content(prompt)
-            json_data = self.extract_json(response.text)
+            response = self.llm.invoke(prompt)
+            json_data = self.extract_json(response)
             modules_data = json.loads(json_data)
             
             modules = []
@@ -631,6 +568,47 @@ class StudyModuleGeneratorAgent:
         except Exception as e:
             st.error(f"Error generating modules: {str(e)}")
             return []
+
+# ======================
+# LANGCHAIN AGENT SETUP
+# ======================
+
+def initialize_agent(api_key: str):
+    """Initialize LangChain agent with tools"""
+    llm = GoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
+    
+    tools = [
+        Tool(
+            name="CalendarSync",
+            func=lambda input: json.dumps(CalendarSyncAgent.parse_uploaded_events(input)),
+            description="Parses academic calendars and personal events from CSV/JSON files"
+        ),
+        Tool(
+            name="StudyModuleGenerator",
+            func=lambda input: json.dumps(StudyModuleGeneratorAgent(api_key).generate_study_modules(input)),
+            description="Generates study modules based on user profile"
+        ),
+        Tool(
+            name="ScheduleOptimizer",
+            func=lambda input: json.dumps(ScheduleOptimizerAgent(api_key).create_adaptive_schedule(
+                input["modules"], input["events"], input["fatigue"]
+            )),
+            description="Creates adaptive study schedules considering life events and fatigue"
+        ),
+        Tool(
+            name="CognitiveLoadEstimator",
+            func=lambda input: json.dumps(asdict(CognitiveLoadEstimatorAgent.calculate_fatigue_metrics(
+                input["events"], input["study_hours"]
+            ))),
+            description="Estimates cognitive load based on life events and study hours"
+        )
+    ]
+    
+    prompt = hub.pull("hwchase17/react")
+    agent = create_react_agent(llm, tools, prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    
+    return agent_executor
 
 # ======================
 # MAIN APPLICATION
@@ -652,6 +630,10 @@ def main():
     schedule_agent = ScheduleOptimizerAgent(api_key)
     rag_agent = PersonalizationFrameworkRetrieverAgent(api_key)
     module_agent = StudyModuleGeneratorAgent(api_key)
+    
+    # Initialize LangChain agent
+    if st.session_state.agent_executor is None:
+        st.session_state.agent_executor = initialize_agent(api_key)
     
     # Sidebar Configuration
     st.sidebar.header("📚 Study Profile")
@@ -713,7 +695,6 @@ def main():
     
     # Generate Plan
     if st.sidebar.button("🚀 Generate Adaptive Plan", type="primary", use_container_width=True):
-        # Check RAG initialization
         if not st.session_state.get('rag_initialized'):
             st.error("Please upload knowledge base PDFs first")
             return
@@ -772,13 +753,11 @@ def main():
             
             data = st.session_state.study_data
             
-            # Current alerts
             if data['alerts']:
                 st.subheader("🚨 Current Alerts")
                 for alert in data['alerts']:
                     st.warning(alert)
             
-            # Schedule table
             if data['schedule']:
                 schedule_df = pd.DataFrame([
                     {
@@ -793,7 +772,6 @@ def main():
                 ])
                 st.dataframe(schedule_df, use_container_width=True, hide_index=True)
                 
-                # Timeline chart
                 fig = px.timeline(
                     schedule_df.head(10),
                     x_start="Date",
@@ -811,7 +789,6 @@ def main():
             
             data = st.session_state.study_data
             
-            # Fatigue metrics
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Mental Load", f"{data['fatigue'].mental_load:.0%}", help="Current cognitive workload")
@@ -820,15 +797,13 @@ def main():
             with col3:
                 st.metric("Capacity", f"{data['fatigue'].weekly_capacity:.0%}", help="Available weekly study capacity")
             
-            # Upcoming events impact
             st.subheader("📅 Upcoming Events Impact")
             for event in data['events']:
                 days_until = (event.date - datetime.now()).days
-                if days_until >= 0 and days_until <= 14:  # Only show upcoming 2 weeks
+                if days_until >= 0 and days_until <= 14:
                     impact_color = ["🟢", "🟡", "🟠", "🔴", "🚨"][min(event.impact_level-1, 4)]
                     st.write(f"{impact_color} **{event.name}** - {days_until} days away (Impact: {event.impact_level}/5)")
             
-            # Dynamic recommendations
             st.subheader("📝 Adaptive Recommendations")
             if data['fatigue'].stress_level > 0.7:
                 st.error("🚨 High stress detected - Consider lighter study methods and more breaks")
@@ -851,7 +826,6 @@ def main():
             
             data = st.session_state.study_data
             
-            # Module priorities
             modules_df = pd.DataFrame([
                 {
                     'Module': m.name,
@@ -875,7 +849,6 @@ def main():
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # Weekly workload
                 if data['schedule']:
                     schedule_df = pd.DataFrame(data['schedule'])
                     schedule_df['date'] = pd.to_datetime(schedule_df['date'])
@@ -891,25 +864,21 @@ def main():
         with tab4:
             st.header("🤖 RAG-Powered Study Assistant")
             
-            # Initialize chat history
             if st.session_state.chat_history is None:
                 st.session_state.chat_history = []
             
-            # Display chat history
             for msg in st.session_state.chat_history:
                 if msg['role'] == 'user':
                     st.chat_message("user").write(msg['content'])
                 else:
                     st.chat_message("assistant").write(msg['content'])
             
-            # Chat input with RAG
             if question := st.chat_input("Ask about study strategies, scheduling, or productivity..."):
                 st.chat_message("user").write(question)
                 st.session_state.chat_history.append({"role": "user", "content": question})
                 
                 with st.spinner("🧠 Consulting research database..."):
                     try:
-                        # Get RAG response
                         answer = st.session_state.qa_chain.run(question)
                         
                         st.chat_message("assistant").write(answer)
@@ -919,7 +888,6 @@ def main():
                         st.chat_message("assistant").write(error_msg)
                         st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
             
-            # Quick questions
             st.subheader("💡 Quick Questions")
             quick_questions = [
                 "How should I adjust my schedule during exam week?",
@@ -940,7 +908,6 @@ def main():
                                 st.error("Error retrieving answer")
     
     else:
-        # Welcome screen
         st.markdown("""
         ## 🎯 Welcome to Life Event-Aware Study Planner
         
