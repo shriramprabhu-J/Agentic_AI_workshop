@@ -174,10 +174,10 @@ Agents use Gemini via LangChain + JSON output parsing.
 
 ## 📷 Frontend Images & 🎥 Demo Video
 
-1. ![Login Screen](Final_hackathon\frontend\src\assets\image.png)
-2. ![Code Editor](Final_hackathon\frontend\src\assets\image2.png)
-3. ![Feedback Display](Final_hackathon\frontend\src\assets\image2.png)
-4. [Watch Demo Video](Final_hackathon\frontend\src\assets\video.mov)
+1. ![Login Screen](./frontend/src/assets/image.png)
+2. ![Code Editor](./frontend/src/assets/image2.png)
+3. ![Feedback Display](./frontend/src/assets/image2.png)
+4. [🎥 Watch Demo Video](./frontend/src/assets/video.mov)
 
 ## 📅 Future Improvements
 
