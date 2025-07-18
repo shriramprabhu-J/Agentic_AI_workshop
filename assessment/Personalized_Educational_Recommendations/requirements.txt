@@ -1,7 +1,6 @@
-streamlit
-serper
-python-dotenv
-devtools
-google-generativeai
-crewai
-pydantic
+   streamlit
+   python-dotenv
+   devtools
+   pydantic
+   requests
+   google-generativeai==0.8.5
